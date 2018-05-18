@@ -1,6 +1,6 @@
 ﻿<#
 .NOTES
-    Copyright (c) Sergey Gruzdov. All rights reserved.
+    Written by Sergey Gruzdov
     
     .SYNOPSIS
         Clone files using ReFS block cloning
