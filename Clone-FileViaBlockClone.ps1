@@ -1,6 +1,6 @@
 ﻿<#
 .NOTES
-    Written by Sergey Gruzdov
+    Written by Sergey Gruzdov; fixed notaligned filesize by Matasko
     
     .SYNOPSIS
         Clone files using ReFS block cloning
@@ -18,8 +18,10 @@
 param(
     [ValidateNotNullOrEmpty()]
     $InFile,
+#    $InFile = "V:\boot_ipxe.wim",
 
     [ValidateNotNullOrEmpty()]
+#    $OutFile = "V:\boot_ipxe.wim.clone"
     $OutFile
 )
 
@@ -86,6 +88,15 @@ namespace CloneStructs
         public ulong TargetFileOffset;
         public ulong ByteCount;
     }
+
+    public struct FILE_STANDARD_INFO {
+        public ulong AllocationSize;
+        public ulong EndOfFile;
+        public uint NumberOfLinks;
+        public bool DeletePending;
+        public bool Directory;
+    } 
+    
 }
 '@
 
@@ -121,6 +132,7 @@ public static extern bool GetVolumeInformationByHandleW(
 [DllImport("kernel32.dll")]
 public static extern bool GetFileSizeEx(IntPtr hFile, out ulong lpFileSize);
 
+
 [DllImport("kernel32.dll")]
 public static extern bool DeleteFileW(string lpFileName);
 
@@ -141,8 +153,16 @@ public static extern bool SetFileInformationByHandle(
     IntPtr hFile,
     int FileInformationClass,
     IntPtr lpFileInformation,
-    ulong dwBufferSize
+    uint dwBufferSize
     );
+[DllImport("kernel32.dll")]
+public static extern bool GetFileInformationByHandleEx(
+    IntPtr hFile,
+    int FileInformationClass,
+    IntPtr lpFileInformation,
+    uint dwBufferSize
+    );
+
 ‘@
 
 Write-Host "Clone file using ReFS Block Clone. Written by Sergey Gruzdov (egel@egel.su)"
@@ -181,6 +201,25 @@ try
     {
         throw "Unable to get size of source file '$InFile'"
     }
+
+    $fileInfo = New-Object CloneStructs.FILE_STANDARD_INFO
+    $type = $fileInfo.GetType()
+    $ptrInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([System.Runtime.InteropServices.Marshal]::SizeOf($fileInfo))
+    [System.Runtime.InteropServices.Marshal]::StructureToPtr($FileInfo, $ptrInfo, $false)
+    $result = $Methods::GetFileInformationByHandleEx($hInFile,1,$ptrInfo,[System.Runtime.InteropServices.Marshal]::SizeOf($fileInfo))
+    $sourceFileIntegrity = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrInfo,[System.Type]$type)
+    $fileInfoOut  = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrInfo,[System.Type]($type))
+    $SourceFileSizeOnDisk = $fileInfoOut.AllocationSize
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($ptrInfo)
+	if (!$result)
+    {
+        throw "Unable to GetFileInformationByHandleEx of source file '$InFile'"
+    }
+    $diff = $SourceFileSizeOnDisk-$SourceFileSize
+    if ($diff -gt 0) {
+        Write-Host "Size:'$SourceFileSize' SizeOnDisk: '$SourceFileSizeOnDisk' Differences: '$diff'"
+    }
+
 
 	$hOutFile = $Methods::CreateFileW($OutFile, $GENERIC_READ -bor $GENERIC_WRITE -bor $DELETE, 0, [IntPtr]::Zero, $CREATE_NEW, 0, $hInFile)
 	if ($hOutFile -eq $INVALID_HANDLE_VALUE)
@@ -234,7 +273,8 @@ try
 	}
     #
 
-    $ByteCount = 1Gb
+    #$ByteCount = 1Gb
+    $ByteCount = 100Mb
 
     $ptrInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($SIZEOF_DUPLICATE_EXTENTS_DATA);
     $dupExtent = New-Object CloneStructs.DUPLICATE_EXTENTS_DATA
@@ -250,11 +290,13 @@ try
 
         if ($FileOffset + $ByteCount -gt $SourceFileSize)
         {
-            $dupExtent.ByteCount = $SourceFileSize - $FileOffset
+            $dupExtent.ByteCount = $SourceFileSize - $FileOffset + $diff
         }
 
         [System.Runtime.InteropServices.Marshal]::StructureToPtr($dupExtent, $ptrInfo, $false)
-        if (!$($Methods::DeviceIoControl($hOutFile, $FSCTL_DUPLICATE_EXTENTS_TO_FILE, $ptrInfo, $SIZEOF_DUPLICATE_EXTENTS_DATA, [IntPtr]::Zero, 0, [ref]$dwRet, [IntPtr]::Zero)))
+
+        $status = $Methods::DeviceIoControl($hOutFile, $FSCTL_DUPLICATE_EXTENTS_TO_FILE, $ptrInfo, $SIZEOF_DUPLICATE_EXTENTS_DATA, [IntPtr]::Zero, 0, [ref]$dwRet, [IntPtr]::Zero)
+        if (!$status)
         {
             throw $("DeviceIoControl failed at offset: {0}", $FileOffset)
         }
@@ -262,7 +304,6 @@ try
         $FileOffset += $ByteCount
     }
     [System.Runtime.InteropServices.Marshal]::FreeHGlobal($ptrInfo)
-
 
     # clear disposition flag, so file dont delete on close
     $disposeInfo.DeleteFile = $false
